@@ -1,0 +1,29 @@
+modules:
+  trigger:
+    - key: issue-assigned-trigger
+      function: handleIssueAssigned
+      events:
+        - avi:jira:assigned:issue
+  webtrigger:
+    - key: telegram-webhook
+      function: handleTelegramCallback
+  
+  function:
+    - key: handleIssueAssigned
+      handler: index.runTrigger
+    - key: handleTelegramCallback
+      handler: index.runWebtrigger
+permissions:
+  scopes:
+    - read:jira-work
+    - write:jira-work
+    - storage:app
+    - read:jira-user
+  external:
+    fetch:
+      backend:
+        - 'https://api.telegram.org'
+app:
+  runtime:
+    name: nodejs22.x
+  id: ari:cloud:ecosystem::app/8ece6349-2e6c-4f68-a9e9-ae7e22817de6
