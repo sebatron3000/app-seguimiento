@@ -1,18 +1,3 @@
-modules:
-  trigger:
-    - key: issue-assigned-trigger
-      function: handleIssueAssigned
-      events:
-        - avi:jira:assigned:issue
-  webtrigger:
-    - key: telegram-webhook
-      function: handleTelegramCallback
-  
-  function:
-    - key: handleIssueAssigned
-      handler: index.runTrigger
-    - key: handleTelegramCallback
-      handler: index.runWebtrigger
 permissions:
   scopes:
     - read:jira-work
@@ -22,7 +7,36 @@ permissions:
   external:
     fetch:
       backend:
-        - 'https://api.telegram.org'
+        - address: https://api.telegram.org
+
+modules:
+  jira:globalPage:
+    - key: telegram-sync-page-v2
+      resource: main-ui
+      render: native
+      resolver:
+        function: render-page-fn
+      title: Telegram Sync
+  trigger:
+    - key: issue-assigned-trigger
+      function: handleIssueAssigned
+      events:
+        - avi:jira:assigned:issue
+  webtrigger:
+    - key: telegram-webhook
+      function: handleTelegramCallback
+  function:
+    - key: render-page-fn
+      handler: index.pageResolver
+    - key: handleIssueAssigned
+      handler: index.runTrigger
+    - key: handleTelegramCallback
+      handler: index.runWebtrigger
+
+resources:
+  - key: main-ui
+    path: src/frontend/index.jsx
+
 app:
   runtime:
     name: nodejs22.x
