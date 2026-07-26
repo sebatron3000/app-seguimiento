@@ -1,5 +1,9 @@
 permissions:
   scopes:
+    - read:board-scope:jira-software
+    - read:project:jira
+    - read:sprint:jira-software
+    - write:sprint:jira-software
     - read:jira-work
     - write:jira-work
     - storage:app
@@ -17,6 +21,13 @@ modules:
       resolver:
         function: render-page-fn
       title: Telegram Sync
+  jira:projectPage:
+    - key: telegram-admin-page
+      resource: admin-ui
+      render: native
+      resolver:
+        function: render-page-fn
+      title: Telegram Admin
   trigger:
     - key: issue-assigned-trigger
       function: handleIssueAssigned
@@ -25,6 +36,10 @@ modules:
   webtrigger:
     - key: telegram-webhook
       function: handleTelegramCallback
+  scheduledTrigger:
+    - key: daily-report-trigger
+      function: handleScheduledPings
+      interval: hour
   function:
     - key: render-page-fn
       handler: index.pageResolver
@@ -32,10 +47,14 @@ modules:
       handler: index.runTrigger
     - key: handleTelegramCallback
       handler: index.runWebtrigger
+    - key: handleScheduledPings
+      handler: index.runScheduledPings
 
 resources:
   - key: main-ui
     path: src/frontend/index.jsx
+  - key: admin-ui
+    path: src/frontend/admin.jsx
 
 app:
   runtime:
