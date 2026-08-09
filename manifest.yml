@@ -1,5 +1,6 @@
 permissions:
   scopes:
+    - read:board-scope.admin:jira-software
     - read:board-scope:jira-software
     - read:project:jira
     - read:sprint:jira-software
@@ -20,14 +21,14 @@ modules:
       render: native
       resolver:
         function: render-page-fn
-      title: Telegram Sync
+      title: PMBot
   jira:projectPage:
     - key: telegram-admin-page
       resource: admin-ui
       render: native
       resolver:
         function: render-page-fn
-      title: Telegram Admin
+      title: PMBot Admin
   trigger:
     - key: issue-assigned-trigger
       function: handleIssueAssigned

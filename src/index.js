@@ -20,6 +20,43 @@ resolver.define('getGlobalProjects', async (req) => {
   }));
 });
 
+// NUEVO: Obtener estados únicos del proyecto para armar la secuencia
+resolver.define('getProjectStatuses', async (req) => {
+  const projectKey = req.context.extension.project.key;
+  const res = await api.asApp().requestJira(route`/rest/api/3/project/${projectKey}/statuses`);
+  if (res.status !== 200) return [];
+  
+  const data = await res.json();
+  const uniqueStatuses = {};
+  
+  // Jira agrupa los estados por tipo de tarea, los aplanamos para mostrar uno de cada uno
+  data.forEach(issueType => {
+    issueType.statuses.forEach(status => {
+      uniqueStatuses[status.id] = {
+        id: status.id,
+        name: status.name,
+        category: status.statusCategory?.key
+      };
+    });
+  });
+  
+  return Object.values(uniqueStatuses);
+});
+
+// NUEVO: Obtener la secuencia configurada
+resolver.define('getWorkflowSequence', async (req) => {
+  const projectKey = req.context.extension.project.key;
+  return await kvs.get(`proj_workflow_${projectKey}`) || [];
+});
+
+// NUEVO: Guardar la secuencia configurada
+resolver.define('saveWorkflowSequence', async (req) => {
+  const projectKey = req.context.extension.project.key;
+  const { sequence } = req.payload; // Recibe un arreglo de IDs: ['10000', '3', '10001']
+  await kvs.set(`proj_workflow_${projectKey}`, sequence);
+  return { success: true };
+});
+
 // ─────────────────────────────────────────────────────────
 // NUEVO: ONBOARDING WIZARD (Configuración Inicial por Empresa)
 // ─────────────────────────────────────────────────────────
@@ -195,6 +232,10 @@ resolver.define('getProjectUsers', async (req) => {
     const reportTime = await kvs.get(`tg_time_${user.accountId}`) || "17:00";
     const reportDays = await kvs.get(`tg_days_${user.accountId}`) || [1, 2, 3, 4, 5]; 
     const isLeader = await kvs.get(`tg_leader_${projectKey}_${user.accountId}`) || false;
+    
+    // NUEVO: Rescatar el estado de activación (por defecto es true si no existe)
+    const isActiveVal = await kvs.get(`tg_active_${user.accountId}`);
+    const isActive = isActiveVal === null ? true : isActiveVal;
 
     return {
       accountId: user.accountId,
@@ -202,10 +243,18 @@ resolver.define('getProjectUsers', async (req) => {
       isSynced: !!chatId,
       reportTime,
       reportDays,
-      isLeader
+      isLeader,
+      isActive // Enviamos esto al frontend
     };
   }));
   return enrichedUsers;
+});
+
+// NUEVA FUNCIÓN: Encender o apagar notificaciones
+resolver.define('toggleUserActiveStatus', async (req) => {
+  const { accountId, isActive } = req.payload;
+  await kvs.set(`tg_active_${accountId}`, isActive);
+  return { success: true };
 });
 
 // NUEVO: Control de Accesos para Telegram Admin
@@ -433,18 +482,21 @@ async function sendTelegramMessage(chatId, text, inlineKeyboard = null) {
 // ─────────────────────────────────────────────────────────
 async function getIssueData(issueKey) {
   try {
-    const res = await api.asApp().requestJira(route`/rest/api/3/issue/${issueKey}?fields=summary,status`);
+    // NUEVO: Agregamos "project" a la petición fields
+    const res = await api.asApp().requestJira(route`/rest/api/3/issue/${issueKey}?fields=summary,status,project`);
     if (res.status === 200) {
       const data = await res.json();
       return {
         summary: data.fields?.summary || "Sin título",
         status: data.fields?.status?.name || "Desconocido",
-        category: data.fields?.status?.statusCategory?.key || "new" // NUEVO: Extraemos la categoría universal
+        statusId: data.fields?.status?.id || null, 
+        category: data.fields?.status?.statusCategory?.key || "new",
+        projectKey: data.fields?.project?.key // <-- NUEVO: Clave del proyecto
       };
     }
-    return { summary: "Sin título", status: "Desconocido", category: "new" };
+    return { summary: "Sin título", status: "Desconocido", statusId: null, category: "new", projectKey: null };
   } catch (error) {
-    return { summary: "Sin título", status: "Desconocido", category: "new" };
+    return { summary: "Sin título", status: "Desconocido", statusId: null, category: "new", projectKey: null };
   }
 }
 
@@ -460,6 +512,42 @@ async function getAvailableTransitions(issueKey) {
     return [];
   } catch (error) {
     return [];
+  }
+}
+
+// ─────────────────────────────────────────────────────────
+// [API JIRA] HELPER: MOTOR DE SECUENCIA PERSONALIZADA (EL CAMINO IDEAL)
+// ─────────────────────────────────────────────────────────
+async function getNextForwardTransition(issueKey, projectKey, currentStatusId) {
+  try {
+    // 1. Obtenemos el "Camino Ideal" configurado por el líder
+    const workflowSequence = await kvs.get(`proj_workflow_${projectKey}`);
+    
+    if (!workflowSequence || workflowSequence.length === 0) {
+      console.log(`⚠️ No hay un flujo configurado en Admin para el proyecto ${projectKey}.`);
+      return null;
+    }
+
+    // 2. Buscamos en qué paso del camino estamos ahora
+    const currentIndex = workflowSequence.indexOf(currentStatusId);
+    
+    // Si la tarea está en un estado que no está en el camino (ej. "Cancelado") o ya llegó al final
+    if (currentIndex === -1 || currentIndex >= workflowSequence.length - 1) {
+      return null;
+    }
+
+    // 3. Calculamos matemáticamente el paso exacto que sigue (+1)
+    const nextStatusId = workflowSequence[currentIndex + 1];
+    
+    // 4. Buscamos la flecha en Jira que nos lleve a ese estado
+    const transitions = await getAvailableTransitions(issueKey);
+    const targetTransition = transitions.find(t => t.to?.id === nextStatusId);
+
+    return targetTransition || null;
+
+  } catch (error) {
+    console.error("Error en motor de secuencia personalizada:", error);
+    return null;
   }
 }
 
@@ -484,16 +572,36 @@ async function getOpenSubtasksCount(issueKey) {
 }
 
 // ─────────────────────────────────────────────────────────
-// [API JIRA] HELPER: TRANSICIÓN DE ESTADO
+// [API JIRA] HELPER: TRANSICIÓN DE ESTADO (Blindada)
 // ─────────────────────────────────────────────────────────
-async function transitionIssue(issueKey, targetStatusName) {
+async function transitionIssue(issueKey, targetIdentifier) {
+  if (!targetIdentifier) return false;
   const transitions = await getAvailableTransitions(issueKey);
-  const transition = transitions.find(
-    t => t.name.toLowerCase() === targetStatusName.toLowerCase() || 
-         t.to.name.toLowerCase() === targetStatusName.toLowerCase()
-  );
+  
+  // Convertimos el dato a string para comparaciones exactas
+  const targetStr = targetIdentifier.toString();
+  
+  // 1. Prioridad: Buscar directamente por el ID de la flecha de transición
+  let transition = transitions.find(t => t.id === targetStr);
 
-  if (!transition) return false;
+  // 2. Respaldo: Buscar por el ID del estado al que queremos llegar (to.id)
+  if (!transition) {
+    transition = transitions.find(t => t.to && t.to.id === targetStr);
+  }
+
+  // 3. Último recurso: Buscar por nombre (Mantiene vivo el sweepSubtasks)
+  if (!transition) {
+    const targetLower = targetStr.trim().toLowerCase();
+    transition = transitions.find(
+      t => (t.name && t.name.trim().toLowerCase() === targetLower) || 
+           (t.to && t.to.name && t.to.name.trim().toLowerCase() === targetLower)
+    );
+  }
+
+  if (!transition) {
+    console.error(`❌ transitionIssue: No se encontró ruta para "${targetStr}" en ${issueKey}`);
+    return false;
+  }
 
   const postResponse = await api.asApp().requestJira(route`/rest/api/3/issue/${issueKey}/transitions`, {
     method: 'POST',
@@ -548,6 +656,9 @@ export async function runTrigger(event, context) {
 
   const chatId = await kvs.get(`tg_chat_${accountId}`);
   if (!chatId) return; 
+
+  const isActive = await kvs.get(`tg_active_${accountId}`);
+  if (isActive === false) return;
 
   // Mensaje puramente informativo, sin botones de acción
   const mensaje = `*Nueva Asignación*\nHola *${asignadoA}*, se te ha asignado la tarea:\n\n📌 *${issueKey} - ${summary}*`;
@@ -610,31 +721,7 @@ export async function runWebtrigger(request) {
       const { issueKey, action } = chatState;
       const issueDataAPI = await getIssueData(issueKey);
 
-      let prefijo = "";
-      let statusMessageExtra = "";
-
-      if (action === 'AVANCE') { 
-        prefijo = "Avance reportado:\n"; 
-        
-        if (issueDataAPI.category === 'new') {
-          const transitions = await getAvailableTransitions(issueKey);
-          const inProgressTransition = transitions.find(t => t.to?.statusCategory?.key === 'indeterminate');
-          
-          if (inProgressTransition) {
-            const postResponse = await api.asApp().requestJira(route`/rest/api/3/issue/${issueKey}/transitions`, {
-              method: 'POST',
-              headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
-              body: JSON.stringify({ transition: { id: inProgressTransition.id } })
-            });
-            
-            if (postResponse.status === 204) {
-               statusMessageExtra = `\nLa tarea fue movida automáticamente a "${inProgressTransition.to.name}".`;
-            }
-          }
-        }
-      }
-      else if (action === 'PROBLEMA') { prefijo = "Motivo de retraso:\n"; }
-
+      let prefijo = action === 'AVANCE' ? "Avance reportado:\n" : "Motivo de retraso:\n";
       const comentarioFinal = `${prefijo}${text}`;
 
       await api.asApp().requestJira(route`/rest/api/3/issue/${issueKey}/comment`, {
@@ -646,7 +733,7 @@ export async function runWebtrigger(request) {
       });
 
       await kvs.delete(`chat_state_${chatId}`);
-      await sendTelegramMessage(chatId, `Tu comentario ha sido publicado en:\n*${issueKey} - ${issueDataAPI.summary}*${statusMessageExtra}`);
+      await sendTelegramMessage(chatId, `Tu comentario ha sido publicado en:\n*${issueKey} - ${issueDataAPI.summary}*`);
       return { body: "OK", statusCode: 200 };
     }
 
@@ -664,140 +751,133 @@ export async function runWebtrigger(request) {
     const tituloCompleto = `*${issueKey} - ${issueDataAPI.summary}*`;
 
     if (source === 'TG') {
-      
-      if (action === 'DONE') {
-        const currentStatus = issueDataAPI.status.toUpperCase();
-        const transitions = await getAvailableTransitions(issueKey);
-        const transitionNames = transitions.map(t => t.name.toUpperCase());
-        
-        const isCurrentlyInReview = currentStatus === 'EN REVISIÓN' || currentStatus === 'EN REVISION';
-        const canReview = (transitionNames.includes('EN REVISIÓN') || transitionNames.includes('EN REVISION')) && !isCurrentlyInReview;
-        const canDone = transitionNames.includes('LISTO') || transitionNames.includes('DONE');
+      try {
+        console.log(`\n▶️ [INICIO ACCIÓN] Comando: ${action} | Tarea: ${issueKey}`);
 
-        const openSubtasksCount = await getOpenSubtasksCount(issueKey);
-        
-        if (openSubtasksCount > 0) {
-          let warningKeyboard = [];
+        // NUEVO FLUJO: Motor de Transición Dinámica (Ágil)
+        if (action === 'FORWARD') {
+          const nextTransition = await getNextForwardTransition(issueKey, issueDataAPI.projectKey, issueDataAPI.statusId);
+          
+          if (nextTransition) {
+            const isMovingToDone = nextTransition.to?.statusCategory?.key === 'done';
+            
+            if (isMovingToDone) {
+              const openSubtasksCount = await getOpenSubtasksCount(issueKey);
+              if (openSubtasksCount > 0) {
+                 const warningKeyboard = [
+                   [ { text: "Sí, avanzar y barrer subtareas", callback_data: `TG_SWEEPFORWARD_${issueKey}` } ],
+                   [ { text: "Cancelar", callback_data: `TG_CANCEL_${issueKey}` } ]
+                 ];
+                 await sendTelegramMessage(chatId, `Atención: La tarea ${tituloCompleto} tiene ${openSubtasksCount} subtarea(s) en curso.\n\n¿Deseas moverla a "${nextTransition.to?.name}" y finalizar automáticamente sus dependencias?`, warningKeyboard);
+                 return { body: "OK", statusCode: 200 };
+              }
+            }
 
-          if (canReview && canDone) {
-            warningKeyboard.push([ { text: "Enviar a Revisión y barrer", callback_data: `TG_SWEEPREVIEW_${issueKey}` } ]);
-            warningKeyboard.push([ { text: "Marcar Listo y barrer", callback_data: `TG_SWEEPLISTO_${issueKey}` } ]);
-          } else if (canReview && !canDone) {
-            warningKeyboard.push([ { text: "Enviar a Revisión y barrer", callback_data: `TG_SWEEPREVIEW_${issueKey}` } ]);
-          } else if (canDone) {
-            warningKeyboard.push([ { text: "Sí, finalizar todo", callback_data: `TG_SWEEPLISTO_${issueKey}` } ]);
-          }
-
-          warningKeyboard.push([ { text: "Cancelar", callback_data: `TG_CANCEL_${issueKey}` } ]);
-
-          if (warningKeyboard.length > 1) {
-            await sendTelegramMessage(chatId, `Atención: La tarea ${tituloCompleto} tiene ${openSubtasksCount} subtarea(s) en curso.\n\n¿A dónde deseas enviar la tarea principal mientras cerramos automáticamente las subtareas?`, warningKeyboard);
+            const transitionSuccess = await transitionIssue(issueKey, nextTransition.id);
+            if (transitionSuccess) {
+              await agregarComentarioFijo(issueKey, `Tarea movida a ${nextTransition.to?.name} vía Telegram.`);
+              await sendTelegramMessage(chatId, `Excelente. Moví el ticket ${tituloCompleto} a "${nextTransition.to?.name}".`);
+            } else {
+              await sendTelegramMessage(chatId, `Hubo un problema al intentar mover ${tituloCompleto}. Verifica si tienes permisos en Jira.`);
+            }
           } else {
-            await sendTelegramMessage(chatId, `No puedes finalizar ${tituloCompleto} desde su estado actual en Jira. Es posible que primero debas reportar un avance.`);
+             await sendTelegramMessage(chatId, `No hay transiciones lógicas disponibles para ${tituloCompleto} en el tablero.`);
           }
-          return { body: "OK", statusCode: 200 };
         }
 
-        if (canReview && canDone) {
+        // NUEVO FLUJO: Barrido automático acoplado al motor dinámico
+        else if (action === 'SWEEPFORWARD') {
+           const nextTransition = await getNextForwardTransition(issueKey, issueDataAPI.projectKey, issueDataAPI.statusId);
+           if (nextTransition) {
+               const transitionSuccess = await transitionIssue(issueKey, nextTransition.id);
+               if (transitionSuccess) {
+                 const subtasksClosed = await sweepSubtasks(issueKey);
+                 const sweepMsg = subtasksClosed > 0 ? `\nBarrido automático: Se cerraron ${subtasksClosed} subtareas asociadas.` : "";
+                 await agregarComentarioFijo(issueKey, `Tarea y subtareas movidas en bloque vía Telegram.${sweepMsg}`);
+                 await sendTelegramMessage(chatId, `Excelente. Moví el ticket ${tituloCompleto} y sus dependencias a "${nextTransition.to?.name}".${sweepMsg}`);
+               } else {
+                 await sendTelegramMessage(chatId, `Hubo un problema al intentar mover ${tituloCompleto} y sus subtareas.`);
+               }
+           }
+        }
+
+        // NUEVO FLUJO: El Doble Salto (Lector Visual)
+        else if (action === 'DOUBLEJUMP') {
+           if (issueDataAPI.category !== 'new') {
+               await sendTelegramMessage(chatId, `La tarea ya no se encuentra en su estado inicial. Utiliza las opciones de avance estándar.`);
+               return { body: "OK", statusCode: 200 };
+           }
+
+           // 1er Salto
+           const firstTransition = await getNextForwardTransition(issueKey, issueDataAPI.projectKey, issueDataAPI.statusId);
+           if (!firstTransition) {
+               await sendTelegramMessage(chatId, `Error de lectura: No fue posible identificar la siguiente etapa estructural para ${tituloCompleto}.`);
+               return { body: "OK", statusCode: 200 };
+           }
+
+           const firstSuccess = await transitionIssue(issueKey, firstTransition.id);
+           if (!firstSuccess) {
+               await sendTelegramMessage(chatId, `Error de permisos: Jira rechazó iniciar la tarea ${tituloCompleto}.`);
+               return { body: "OK", statusCode: 200 };
+           }
+
+           // Tiempo ampliado para permitir la indexación en los servidores de Atlassian Cloud
+           await new Promise(resolve => setTimeout(resolve, 2000));
+
+           // 2do Salto
+           const secondTransition = await getNextForwardTransition(issueKey, issueDataAPI.projectKey, firstTransition.to.id);
+           if (secondTransition) {
+               const secondSuccess = await transitionIssue(issueKey, secondTransition.id);
+               if (secondSuccess) {
+                   await agregarComentarioFijo(issueKey, `Tarea avanzada directamente a "${secondTransition.to?.name}" (Doble salto) vía Telegram.`);
+                   await sendTelegramMessage(chatId, `Gestión completada. El ticket ${tituloCompleto} fue avanzado directo a "${secondTransition.to?.name}".`);
+               } else {
+                   await sendTelegramMessage(chatId, `El ticket inició en "${firstTransition.to?.name}", pero Jira bloqueó la transición a la siguiente etapa.`);
+               }
+           } else {
+               await sendTelegramMessage(chatId, `El ticket avanzó a "${firstTransition.to?.name}", pero no se detectó una etapa posterior disponible de forma automática.`);
+           }
+        }
+
+        // NUEVO FLUJO: Reportar avances
+        else if (action === 'AVANCE') {
+          if (issueDataAPI.category === 'new') {
+            const nextTransition = await getNextForwardTransition(issueKey, issueDataAPI.projectKey, issueDataAPI.statusId);
+            if (nextTransition) {
+              await transitionIssue(issueKey, nextTransition.id);
+            }
+          }
+          await kvs.set(`chat_state_${chatId}`, { issueKey, action: 'AVANCE' });
+          await sendTelegramMessage(chatId, `¿Qué avances lograste en:\n${tituloCompleto}?\n\nEscríbelo en un mensaje y lo registraré.\n_(Escribe "cancelar" para abortar)_`);
+        } 
+        
+        else if (action === 'SINAVANCE') {
           const subMenuKeyboard = [
-            [ { text: "Enviar a Revisión", callback_data: `TG_REVISION_${issueKey}` } ],
-            [ { text: "Marcar como Listo", callback_data: `TG_LISTO_${issueKey}` } ],
-            [ { text: "Cancelar", callback_data: `TG_CANCEL_${issueKey}` } ]
+            [ { text: "Reportar problema", callback_data: `TG_PROBLEMA_${issueKey}` } ],
+            [ { text: "Sin problemas", callback_data: `TG_SINPROBLEMA_${issueKey}` } ]
           ];
-          await sendTelegramMessage(chatId, `La tarea ${tituloCompleto} tiene múltiples caminos de cierre.\n\n¿A dónde deseas enviarla?`, subMenuKeyboard);
-        } 
-        else if (canReview && !canDone) {
-          const transitionSuccess = await transitionIssue(issueKey, "EN REVISIÓN");
-          if (transitionSuccess) {
-            await agregarComentarioFijo(issueKey, "Tarea enviada a Revisión vía Telegram.");
-            await sendTelegramMessage(chatId, `Entendido. Moví el ticket ${tituloCompleto} a "EN REVISIÓN".`);
-          }
-        } 
-        else if (canDone) {
-          const transitionSuccess = await transitionIssue(issueKey, "LISTO");
-          if (transitionSuccess) {
-            await agregarComentarioFijo(issueKey, "Tarea marcada como Terminada vía Telegram.");
-            await sendTelegramMessage(chatId, `Excelente. Moví el ticket ${tituloCompleto} a "LISTO".`);
-          }
-        } 
-        else {
-          await sendTelegramMessage(chatId, `No puedes finalizar ${tituloCompleto} desde su estado actual en Jira. Es posible que primero debas reportar un avance.`);
+          await sendTelegramMessage(chatId, `¿Hay algún problema o bloqueo con:\n${tituloCompleto}?\n\nSelecciona una opción:`, subMenuKeyboard);
         }
-      }
-      
-      else if (action === 'SWEEPREVIEW') {
-        const transitionSuccess = await transitionIssue(issueKey, "EN REVISIÓN");
-        if (transitionSuccess) {
-          const subtasksClosed = await sweepSubtasks(issueKey);
-          const sweepMsg = subtasksClosed > 0 ? `\nBarrido automático: Se cerraron ${subtasksClosed} subtareas asociadas.` : "";
-          await agregarComentarioFijo(issueKey, `Tarea enviada a Revisión y subtareas finalizadas vía Telegram.${sweepMsg}`);
-          await sendTelegramMessage(chatId, `Entendido. Moví el ticket ${tituloCompleto} a "EN REVISIÓN".${sweepMsg}`);
-        } else {
-          await sendTelegramMessage(chatId, `Hubo un problema al intentar mover ${tituloCompleto} a Revisión.`);
+
+        else if (action === 'PROBLEMA') {
+          await kvs.set(`chat_state_${chatId}`, { issueKey, action: 'PROBLEMA' });
+          await sendTelegramMessage(chatId, `Entendido. ¿Cuál es el problema con:\n${tituloCompleto}?\n\nEscríbelo abajo para dejar el registro en Jira.\n_(Escribe "cancelar" para abortar)_`);
         }
-      }
 
-      else if (action === 'SWEEPLISTO') {
-        const transitionSuccess = await transitionIssue(issueKey, "LISTO");
-        if (transitionSuccess) {
-          const subtasksClosed = await sweepSubtasks(issueKey);
-          const sweepMsg = subtasksClosed > 0 ? `\nBarrido automático: Se cerraron ${subtasksClosed} subtareas asociadas.` : "";
-          await agregarComentarioFijo(issueKey, `Tarea y subtareas marcadas como Terminadas en bloque vía Telegram.${sweepMsg}`);
-          await sendTelegramMessage(chatId, `Excelente. Moví el ticket ${tituloCompleto} y sus dependencias a "LISTO".${sweepMsg}`);
-        } else {
-          await sendTelegramMessage(chatId, `Hubo un problema al intentar cerrar ${tituloCompleto} y sus subtareas.`);
+        else if (action === 'SINPROBLEMA') {
+          await sendTelegramMessage(chatId, `Entendido. Tarea ${issueKey} sin novedades por hoy.`);
         }
-      }
 
-      else if (action === 'REVISION') {
-        const transitionSuccess = await transitionIssue(issueKey, "EN REVISIÓN");
-        if (transitionSuccess) {
-          await agregarComentarioFijo(issueKey, "Tarea enviada a Revisión vía Telegram.");
-          await sendTelegramMessage(chatId, `Entendido. Moví el ticket ${tituloCompleto} a "EN REVISIÓN".`);
-        } else {
-          await sendTelegramMessage(chatId, `Hubo un problema al mover ${tituloCompleto} a "EN REVISIÓN".`);
+        else if (action === 'CANCEL') {
+          await kvs.delete(`chat_state_${chatId}`);
+          await sendTelegramMessage(chatId, `Acción cancelada.`);
         }
-      }
 
-      else if (action === 'LISTO') {
-        const transitionSuccess = await transitionIssue(issueKey, "LISTO");
-        if (transitionSuccess) {
-          await agregarComentarioFijo(issueKey, "Tarea marcada como Terminada vía Telegram.");
-          await sendTelegramMessage(chatId, `Excelente. Moví el ticket ${tituloCompleto} a "LISTO".`);
-        } else {
-          await sendTelegramMessage(chatId, `Hubo un problema al mover ${tituloCompleto} a "LISTO".`);
-        }
+      } catch (error) {
+        console.error(`❌ [ERROR CRÍTICO] Acción: ${action} | Tarea: ${issueKey}`);
+        console.error(error);
+        await sendTelegramMessage(chatId, `⚠️ Ups, ocurrió un error interno al intentar procesar tu solicitud.`);
       }
-
-      // NUEVO FLUJO PRINCIPAL: AVANCES Y SIN AVANCES ANIDADO
-      else if (action === 'AVANCE') {
-        await kvs.set(`chat_state_${chatId}`, { issueKey, action: 'AVANCE' });
-        await sendTelegramMessage(chatId, `¿Qué avances lograste en:\n${tituloCompleto}?\n\nEscríbelo en un mensaje y lo registraré.\n_(Escribe "cancelar" para abortar)_`);
-      } 
-      
-      else if (action === 'SINAVANCE') {
-        const subMenuKeyboard = [
-          [ { text: "Reportar problema", callback_data: `TG_PROBLEMA_${issueKey}` } ],
-          [ { text: "Sin problemas", callback_data: `TG_SINPROBLEMA_${issueKey}` } ]
-        ];
-        await sendTelegramMessage(chatId, `¿Hay algún problema o bloqueo con:\n${tituloCompleto}?\n\nSelecciona una opción:`, subMenuKeyboard);
-      }
-
-      else if (action === 'PROBLEMA') {
-        await kvs.set(`chat_state_${chatId}`, { issueKey, action: 'PROBLEMA' });
-        await sendTelegramMessage(chatId, `Entendido. ¿Cuál es el problema con:\n${tituloCompleto}?\n\nEscríbelo abajo para dejar el registro en Jira.\n_(Escribe "cancelar" para abortar)_`);
-      }
-
-      else if (action === 'SINPROBLEMA') {
-        // Interacción finalizada silenciosamente, queda documentada en el reporte de 24h
-        await sendTelegramMessage(chatId, `Entendido. Tarea ${issueKey} sin novedades por hoy.`);
-      }
-
-      else if (action === 'CANCEL') {
-        await kvs.delete(`chat_state_${chatId}`);
-        await sendTelegramMessage(chatId, `Acción cancelada.`);
-      }
-
     } 
   }
 
@@ -913,6 +993,9 @@ export async function runScheduledPings(event, context, isForced = false, target
       for (const [accountId, userData] of Object.entries(userTasks)) {
         const chatId = await kvs.get(`tg_chat_${accountId}`);
         if (!chatId) continue; 
+
+        const isActive = await kvs.get(`tg_active_${accountId}`);
+        if (isActive === false) continue;
         
         const reportTime = await kvs.get(`tg_time_${accountId}`) || "17:00";
         const reportDays = await kvs.get(`tg_days_${accountId}`) || [1, 2, 3, 4, 5];
@@ -929,15 +1012,38 @@ export async function runScheduledPings(event, context, isForced = false, target
               if (issue.fields.duedate < todayStr) timeStatus += " (Atrasada)";
               else if (issue.fields.duedate === todayStr) timeStatus += " (Vence hoy)";
             }
+
+            // 1. Extraemos la categoría y el nombre actual
+            const statusCategory = issue.fields.status?.statusCategory?.key || 'new';
+            const statusName = issue.fields.status?.name || 'Desconocido';
             
-            // Botones configurados para respetar el límite de 3 opciones (escalabilidad a WhatsApp)
+            // 2. Consultamos al motor lógico cuál es el siguiente paso
+            const nextTransition = await getNextForwardTransition(issue.key, proj.key, issue.fields.status?.id);
+
+            // 3. Armamos la base inamovible de los 2 primeros botones
             const taskKeyboard = [
               [ { text: "Con avances", callback_data: `TG_AVANCE_${issue.key}` } ],
-              [ { text: "Sin avances", callback_data: `TG_SINAVANCE_${issue.key}` } ],
-              [ { text: "Terminada", callback_data: `TG_DONE_${issue.key}` } ]
+              [ { text: "Sin avances", callback_data: `TG_SINAVANCE_${issue.key}` } ]
             ];
+
+            // 4. Construcción dinámica del TERCER botón
+            if (statusCategory === 'new') {
+               // ESCENARIO A (En To Do): No sabemos el nombre de la etapa 3 aún, usamos texto genérico.
+               taskKeyboard.push([ { text: "Avanzar a siguiente etapa", callback_data: `TG_DOUBLEJUMP_${issue.key}` } ]);
+            } 
+            else if (nextTransition) {
+               // ESCENARIO B (En Doing): Jira sí nos deja ver la siguiente etapa real.
+               let stageName = nextTransition.to.name;
+               if (stageName.length > 15) stageName = stageName.substring(0, 15) + "...";
+               taskKeyboard.push([ { text: `Mover a ${stageName}`, callback_data: `TG_FORWARD_${issue.key}` } ]);
+            } 
+            else if (statusCategory === 'indeterminate') {
+               // Fallback: Si no hay transiciones intermedias hacia adelante
+               taskKeyboard.push([ { text: "Marcar como Terminada", callback_data: `TG_FORWARD_${issue.key}` } ]);
+            }
+
             const summaryLink = `[${issue.fields.summary}](${baseUrl}/browse/${issue.key})`;
-            await sendTelegramMessage(chatId, `*${issue.key}* - ${summaryLink}\n_Estado: ${issue.fields.status.name}${timeStatus}_`, taskKeyboard);
+            await sendTelegramMessage(chatId, `↳ *${issue.key}* - ${summaryLink}\n_Estado: ${statusName}${timeStatus}_`, taskKeyboard);
           }
         }
       }
@@ -962,8 +1068,8 @@ export async function runScheduledPings(event, context, isForced = false, target
         if (leaderChatIds.length > 0) {
           if (validTasks.length === 0) {
             const emptyMsg = mode === 'SCRUM' 
-              ? `☕ *Sin Novedades en ${proj.name}*\nNo hay tareas en un Sprint activo que requieran seguimiento hoy.`
-              : `☕ *Sin Novedades en ${proj.name}*\nEl tablero está vacío o todas las tareas están bloqueadas/en el futuro.`;
+              ? `⭘ *Sin Novedades en ${proj.name}*\nNo hay tareas en un Sprint activo que requieran seguimiento hoy.`
+              : `⭘ *Sin Novedades en ${proj.name}*\nEl tablero está vacío o todas las tareas están bloqueadas/en el futuro.`;
             for (const chat of leaderChatIds) await sendTelegramMessage(chat, emptyMsg);
             continue;
           }
@@ -982,13 +1088,13 @@ export async function runScheduledPings(event, context, isForced = false, target
               dueText = ` (V: ${dd}-${mm}-${yyyy})`;
             }
             
-            // Agregamos dueText al lado del nombre en cada categoría
+            // Agregamos dueText al lado del nombre en cada categoría y usamos el ícono ↳
             if (issue.fields.resolution || issue.fields.status?.statusCategory?.key === 'done') {
-              terminadas.push(`🏁 *${issue.key}* - _${name}_${dueText}`);
+              terminadas.push(`↳ *${issue.key}* - _${name}_${dueText}`);
               continue; 
             }
 
-            if (issue.fields.duedate && issue.fields.duedate < todayStr) atrasadas.push(`📌 *${issue.key}* - _${name}_${dueText}\n    Venció el ${issue.fields.duedate}`);
+            if (issue.fields.duedate && issue.fields.duedate < todayStr) atrasadas.push(`↳ *${issue.key}* - _${name}_${dueText}\n    Venció el ${issue.fields.duedate}`);
 
             const updatedDate = new Date(issue.fields.updated);
             if (updatedDate > yesterday) {
@@ -1002,31 +1108,36 @@ export async function runScheduledPings(event, context, isForced = false, target
                   if (cDate > yesterday) {
                     const text = c.body?.content?.[0]?.content?.[0]?.text || "";
                     if (text.includes("Motivo de retraso:") || text.includes("Problema reportado:")) {
-                      problemas.push(`📌 *${issue.key}* - _${name}_${dueText}\n    💬 _"${text.split('\n').pop()}"_`);
+                      problemas.push(`↳ *${issue.key}* - _${name}_${dueText}\n    💬 _"${text.split('\n').pop()}"_`);
                       categorized = true; break;
                     }
                     if (text.includes("Avance reportado:")) {
-                      avances.push(`📌 *${issue.key}* - _${name}_${dueText}\n    💬 _"${text.split('\n').pop()}"_`);
+                      avances.push(`↳ *${issue.key}* - _${name}_${dueText}\n    💬 _"${text.split('\n').pop()}"_`);
                       categorized = true; break;
                     }
                   }
                 }
               }
-              if (!categorized) sinNovedades.push(`📌 *${issue.key}* - _${name}_${dueText}`);
+              if (!categorized) sinNovedades.push(`↳ *${issue.key}* - _${name}_${dueText}`);
             } else {
-              sinNovedades.push(`📌 *${issue.key}* - _${name}_${dueText}`);
+              sinNovedades.push(`↳ *${issue.key}* - _${name}_${dueText}`);
             }
           }
 
-          // ACTUALIZADO: Hipervínculo directo en el nombre del proyecto
+          // NUEVO: Hipervínculo directo y estética monocromática sin monospace
           let digestMsg = `📊 *Reporte Diario de Gestión:* [${proj.name}](${baseUrl}/browse/${proj.key})\n_Últimas 24 horas_\n\n`;
-          digestMsg += `🏁 \`${terminadas.length}\` Terminadas | 🔴 \`${atrasadas.length}\` Atrasadas\n🛑 \`${problemas.length}\` Problemas | 🚀 \`${avances.length}\` Avances\n⏳ \`${sinNovedades.length}\` Sin novedades\n\n`;
           
-          if (terminadas.length > 0) digestMsg += `🏁 **TERMINADAS HOY**\n${terminadas.join('\n')}\n\n`;
-          if (atrasadas.length > 0) digestMsg += `🔴 **ATRASADAS**\n${atrasadas.join('\n')}\n\n`;
-          if (problemas.length > 0) digestMsg += `🛑 **PROBLEMAS Y BLOQUEOS**\n${problemas.join('\n')}\n\n`;
-          if (avances.length > 0) digestMsg += `🚀 **AVANCES**\n${avances.join('\n')}\n\n`;
-          if (sinNovedades.length > 0) digestMsg += `⏳ **SIN NOVEDADES HOY**\n${sinNovedades.join('\n')}`;
+          digestMsg += `✓  Terminadas:       ${terminadas.length}\n`;
+          digestMsg += `⬈  Avances:             ${avances.length}\n`;
+          digestMsg += `⊘  Problemas:         ${problemas.length}\n`;
+          digestMsg += `◬  Atrasadas:          ${atrasadas.length}\n`;
+          digestMsg += `⭘  Sin Novedades:  ${sinNovedades.length}\n\n`;
+          
+          if (terminadas.length > 0) digestMsg += `*✓ TERMINADAS HOY*\n${terminadas.join('\n')}\n\n`;
+          if (avances.length > 0) digestMsg += `*⬈ AVANCES*\n${avances.join('\n')}\n\n`;
+          if (problemas.length > 0) digestMsg += `*⊘ PROBLEMAS Y BLOQUEOS*\n${problemas.join('\n')}\n\n`;
+          if (atrasadas.length > 0) digestMsg += `*◬ ATRASADAS*\n${atrasadas.join('\n')}\n\n`;
+          if (sinNovedades.length > 0) digestMsg += `*⭘ SIN NOVEDADES HOY*\n${sinNovedades.join('\n')}`;
 
           for (const chat of leaderChatIds) await sendTelegramMessage(chat, digestMsg);
         }

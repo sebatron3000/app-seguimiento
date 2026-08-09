@@ -1,5 +1,5 @@
 {
-  "name": "jira-workflow-postfunction",
+  "name": "pmbot",
   "version": "1.1.5",
   "main": "src/index.js",
   "license": "MIT",
