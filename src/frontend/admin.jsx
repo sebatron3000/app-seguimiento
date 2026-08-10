@@ -78,9 +78,6 @@ const AdminPanel = () => {
     setTimeout(() => setSuccessMsg(null), 5000);
   };
 
-  // ----------------------------------------------------
-  // FUNCIONES DE LA RUTA DE TRABAJO (WORKFLOW)
-  // ----------------------------------------------------
   const handleMoveUp = (index) => {
     if (index === 0) return;
     const newWf = [...workflowSequence];
@@ -132,9 +129,9 @@ const AdminPanel = () => {
   };
 
   const workflowRows = workflowSequence.map((statusId, index) => ({
-    key: statusId,
+    key: statusId || `step-${index}`,
     cells: [
-      { key: 'step', content: <Text weight="bold">{index + 1}</Text> }, // Eliminados los asteriscos, ahora usa negrita nativa
+      { key: 'step', content: <Text weight="bold">{index + 1}</Text> },
       { key: 'status', content: <Text>{getStatusName(statusId)}</Text> },
       { key: 'actions', content: (
           <Inline space="space.100">
@@ -147,9 +144,6 @@ const AdminPanel = () => {
     ]
   }));
 
-  // ----------------------------------------------------
-  // FUNCIONES DE EQUIPO Y USUARIOS
-  // ----------------------------------------------------
   const handleToggleLeader = async (user) => {
     const projectKey = context?.extension?.project?.key;
     const newStatus = !user.isLeader;
@@ -216,9 +210,6 @@ const AdminPanel = () => {
     setTimeout(() => setSuccessMsg(null), 5000);
   };
 
-  // ----------------------------------------------------
-  // RENDERIZADO CONDICIONAL
-  // ----------------------------------------------------
   if (hasAccess === null) return <Spinner size="large" />;
 
   if (hasAccess === false) {
@@ -300,7 +291,12 @@ const AdminPanel = () => {
           <Inline space="space.100">
             <Button onClick={() => startEdit(user)}>Editar</Button>
             <Button onClick={() => handleToggleLeader(user)}>{user.isLeader ? "Quitar Líder" : "Hacer Líder"}</Button>
+            
             {!user.isSynced && <Button appearance="discovery" onClick={() => handleInviteTask(user)}>Invitar</Button>}
+            
+            {/* NUEVO: Permite re-generar invitación para usuarios que quedaron atrapados en la arquitectura antigua */}
+            {user.isSynced && <Button appearance="subtle" onClick={() => handleInviteTask(user)}>Re-vincular</Button>}
+            
             {user.isSynced && <Button onClick={() => handleTestReport(user)}>Probar</Button>}
           </Inline>
         ) 
@@ -327,7 +323,6 @@ const AdminPanel = () => {
 
       <Stack space="space.200" />
 
-      {/* SECCIÓN 2: RUTA DE TRABAJO (HAPPY PATH) */}
       <Stack space="space.200">
         <Heading as="h3">Ruta de Trabajo Lineal</Heading>
         <Text>Define la secuencia exacta por la que avanzarán las tareas. Los estados omitidos requerirán ser gestionados manualmente en Jira.</Text>
@@ -338,7 +333,6 @@ const AdminPanel = () => {
           </SectionMessage>
         )}
 
-        {/* SELECTOR COMPACTO POSICIONADO SOBRE LA TABLA */}
         <Inline space="space.100" alignBlock="center">
           <Select 
             placeholder="Selecciona un estado..."
@@ -350,7 +344,6 @@ const AdminPanel = () => {
           <Button appearance="discovery" onClick={handleSaveWorkflow}>Guardar Ruta Definitiva</Button>
         </Inline>
 
-        {/* TABLA PRINCIPAL DE FLUJO */}
         <DynamicTable head={workflowHead} rows={workflowRows} />
       </Stack>
 

@@ -12,6 +12,7 @@ permissions:
   external:
     fetch:
       backend:
+        - address: pmbot-proxy-tgtrm3z5ca-uc.a.run.app
         - address: https://api.telegram.org
 
 modules:

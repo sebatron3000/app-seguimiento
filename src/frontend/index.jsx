@@ -1,20 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { invoke } from '@forge/bridge';
-import ForgeReconciler, {
-  Text,
-  Select,
-  Stack,
-  Inline,
-  Box,
-  Heading,
-  DynamicTable,
-  Button,
-  Textfield,
-  SectionMessage,
-  xcss
-} from '@forge/react';
+import ForgeReconciler, { Text, Select, Stack, Inline, Box, Heading, DynamicTable, Button, xcss } from '@forge/react';
 
-// Estilo de tarjetas
 const cardStyle = xcss({
   backgroundColor: 'elevation.surface.raised',
   padding: 'space.300',
@@ -40,14 +27,6 @@ const centerText = (text, isBold = false) => (
 );
 
 const App = () => {
-  // Estados de Onboarding
-  const [isConfigured, setIsConfigured] = useState(false);
-  const [isLoadingSetup, setIsLoadingSetup] = useState(true);
-  const [inputToken, setInputToken] = useState('');
-  const [setupError, setSetupError] = useState(null);
-  const [isValidating, setIsValidating] = useState(false);
-
-  // Estados del Dashboard
   const [selectedProjects, setSelectedProjects] = useState([]);
   const [timeGrouping, setTimeGrouping] = useState('semanas');
   const [selectedCohort, setSelectedCohort] = useState('all');
@@ -58,25 +37,13 @@ const App = () => {
   const [tableDataRaw, setTableDataRaw] = useState([]);
 
   useEffect(() => {
-    // 1. Verificamos si la empresa ya configuró su Bot
-    invoke('getBotSetup').then((res) => {
-      setIsConfigured(res.isSetup);
-      setIsLoadingSetup(false);
-      
-      // Si ya está configurado, cargamos los datos del panel directamente
-      if (res.isSetup) {
-        loadDashboardData();
-      }
-    });
-  }, []);
-
-  const loadDashboardData = () => {
+    // Al ser una arquitectura de bot centralizado, la interfaz salta directamente al panel
     invoke('getGlobalProjects').then((data) => {
       setProjectOptions([{ label: 'Todos los proyectos', value: 'all' }, ...data]);
       setIsLoadingProjects(false);
     });
     fetchKPIs(); 
-  };
+  }, []);
 
   const fetchKPIs = () => {
     setIsApplying(true);
@@ -88,73 +55,6 @@ const App = () => {
       });
   };
 
-  const handleConnectBot = () => {
-    if (!inputToken.trim()) return;
-    setIsValidating(true);
-    setSetupError(null);
-    
-    invoke('saveBotToken', { token: inputToken.trim() }).then((res) => {
-      setIsValidating(false);
-      if (res.success) {
-        setIsConfigured(true);
-        loadDashboardData();
-      } else {
-        setSetupError(res.error);
-      }
-    });
-  };
-
-  // ─────────────────────────────────────────────────────────
-  // VISTA 1: ONBOARDING WIZARD (Asistente de configuración)
-  // ─────────────────────────────────────────────────────────
-  if (isLoadingSetup) {
-    return <Text>Cargando panel...</Text>;
-  }
-
-  if (!isConfigured) {
-    return (
-      <Stack space="space.400">
-        <Box xcss={xcss({ maxWidth: '600px', margin: 'auto', padding: 'space.400', backgroundColor: 'elevation.surface.raised', borderRadius: 'border.radius', boxShadow: 'elevation.shadow.raised' })}>
-          <Stack space="space.300">
-            <Heading size="large">Conecta tu Project Manager Bot 🤖</Heading>
-            <Text>Bienvenido. Para que Telegram Sync pueda notificar y medir la eficiencia de tu equipo, primero necesitamos crear el bot que los asistirá.</Text>
-            
-            <Stack space="space.100">
-              <Text weight="bold">Paso 1: Obtén tu Token de acceso</Text>
-              <Text>Haz clic en el siguiente enlace para ir a Telegram (puedes usar web o teléfono). Presiona "Start" o escribe `/newbot` y sigue las instrucciones para ponerle un nombre a tu asistente.</Text>
-              <Button appearance="subtle" iconAfter="shortcut" onClick={() => window.open('https://t.me/BotFather', '_blank')}>
-                Ir a BotFather en Telegram
-              </Button>
-            </Stack>
-
-            <Stack space="space.100">
-              <Text weight="bold">Paso 2: Pega tu Token aquí</Text>
-              <Text>Cuando BotFather te dé el texto rojo (Ej: 123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11), pégalo abajo:</Text>
-              <Textfield 
-                placeholder="Ingresa el token HTTP API..." 
-                value={inputToken}
-                onChange={(e) => setInputToken(e.target.value)}
-              />
-            </Stack>
-
-            {setupError && (
-              <SectionMessage appearance="error">
-                <Text>{setupError}</Text>
-              </SectionMessage>
-            )}
-
-            <Button appearance="primary" onClick={handleConnectBot} isLoading={isValidating}>
-              Conectar y Activar Panel
-            </Button>
-          </Stack>
-        </Box>
-      </Stack>
-    );
-  }
-
-  // ─────────────────────────────────────────────────────────
-  // VISTA 2: PANEL ESTRATÉGICO (Se muestra cuando isConfigured es true)
-  // ─────────────────────────────────────────────────────────
   const tableHead = {
     cells: [
       { key: 'periodo', content: <Text weight="bold">Periodo</Text> },
