@@ -198,7 +198,8 @@ const AdminPanel = () => {
   };
 
   const handleTestReport = async (user) => {
-    await invoke('triggerManualPings', { accountId: user.accountId, type: 'EXECUTOR' });
+    const projectKey = context?.extension?.project?.key; // <- Ahora sí sabe que es este proyecto Kanban
+    await invoke('triggerManualPings', { accountId: user.accountId, projectKey: projectKey, type: 'EXECUTOR' });
     setSuccessMsg(`Reporte de prueba enviado a ${user.displayName}.`);
     setTimeout(() => setSuccessMsg(null), 5000);
   };

@@ -215,101 +215,119 @@ resolver.define('updateReportTime', async (req) => {
 });
 
 resolver.define('createInviteTask', async (req) => {
-  const { accountId, projectKey } = req.payload;
-  const token = Math.random().toString(36).substring(2, 8).toUpperCase();
-  const expiresAt = Date.now() + (24 * 60 * 60 * 1000); 
-  
-  const webhookUrl = await webTrigger.getUrl('telegram-webhook');
-
-  // Enviar el token al GCP
-  await api.fetch('https://pmbot-proxy-tgtrm3z5ca-uc.a.run.app', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      message: { text: `/start ${token}`, chat: { id: "SYSTEM_REGISTER" } },
-      system_registration: { token, accountId, forgeWebhookUrl: webhookUrl, expiresAt }
-    })
-  });
-
-  // Usamos variable de entorno para el nombre del bot central (ver instrucciones abajo)
-  const botUsername = process.env.BOT_USERNAME || "TuBotCentral"; 
-  const botUrl = `https://t.me/${botUsername}?start=${token}`;
-
-  const projRes = await api.asApp().requestJira(route`/rest/api/3/project/${projectKey}`);
-  const projData = await projRes.json();
-  let issueTypeId = projData.issueTypes?.find(it => !it.subtask)?.id;
-  const preferred = projData.issueTypes?.find(it => !it.subtask && (it.name.toLowerCase() === 'task' || it.name.toLowerCase() === 'tarea'));
-  if (preferred) issueTypeId = preferred.id;
-
-  let activeSprintId = null;
   try {
-    const boardsRes = await api.asApp().requestJira(route`/rest/agile/1.0/board?projectKeyOrId=${projectKey}`);
-    if (boardsRes.status === 200) {
-      const boardsData = await boardsRes.json();
-      for (const board of (boardsData.values || [])) {
-        if (board.type === 'scrum') {
-          const sprintRes = await api.asApp().requestJira(route`/rest/agile/1.0/board/${board.id}/sprint?state=active`);
-          if (sprintRes.status === 200) {
-            const sprintData = await sprintRes.json();
-            if (sprintData.values && sprintData.values.length > 0) {
-              activeSprintId = sprintData.values[0].id;
-              break; 
+    const { accountId, projectKey } = req.payload;
+    const token = Math.random().toString(36).substring(2, 8).toUpperCase();
+    const expiresAt = Date.now() + (24 * 60 * 60 * 1000); 
+    
+    const webhookUrl = await webTrigger.getUrl('telegram-webhook');
+
+    await kvs.set(`pending_token_${token}`, { accountId, expiresAt });
+
+    try {
+      await api.fetch('https://pmbot-proxy-tgtrm3z5ca-uc.a.run.app', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message: { text: `/start ${token}`, chat: { id: "SYSTEM_REGISTER" } },
+          system_registration: { token, accountId, forgeWebhookUrl: webhookUrl, expiresAt }
+        })
+      });
+    } catch (proxyError) {
+      console.error("Advertencia: El proxy GCP tardó en responder, pero continuaremos.", proxyError);
+    }
+
+    const botUsername = process.env.BOT_USERNAME || "JiraSeguimientoBot"; 
+    const botUrl = `https://t.me/${botUsername}?start=${token}`;
+
+    const projRes = await api.asApp().requestJira(route`/rest/api/3/project/${projectKey}`);
+    const projData = await projRes.json();
+    let issueTypeId = projData.issueTypes?.find(it => !it.subtask)?.id;
+    const preferred = projData.issueTypes?.find(it => !it.subtask && (it.name.toLowerCase() === 'task' || it.name.toLowerCase() === 'tarea'));
+    if (preferred) issueTypeId = preferred.id;
+
+    let activeSprintId = null;
+    try {
+      const boardsRes = await api.asApp().requestJira(route`/rest/agile/1.0/board?projectKeyOrId=${projectKey}`);
+      if (boardsRes.status === 200) {
+        const boardsData = await boardsRes.json();
+        for (const board of (boardsData.values || [])) {
+          if (board.type === 'scrum') {
+            const sprintRes = await api.asApp().requestJira(route`/rest/agile/1.0/board/${board.id}/sprint?state=active`);
+            if (sprintRes.status === 200) {
+              const sprintData = await sprintRes.json();
+              if (sprintData.values && sprintData.values.length > 0) {
+                activeSprintId = sprintData.values[0].id;
+                break; 
+              }
             }
           }
         }
       }
+    } catch (error) {
+      console.error("Error buscando sprint activo:", error);
     }
-  } catch (error) {
-    console.error("Error buscando sprint activo:", error);
-  }
 
-  const payload = {
-    fields: {
-      project: { key: projectKey },
-      summary: "Vincular con Telegram",
-      issuetype: { id: issueTypeId },
-      assignee: { id: accountId },
-      description: {
-        type: "doc",
-        version: 1,
-        content: [{ type: "paragraph", content: [{ type: "text", text: botUrl, marks: [{ type: "link", attrs: { href: botUrl } }] }] }]
+    const payload = {
+      fields: {
+        project: { key: projectKey },
+        summary: "Vincular con Telegram",
+        issuetype: { id: issueTypeId },
+        assignee: { id: accountId },
+        description: {
+          type: "doc",
+          version: 1,
+          content: [{ type: "paragraph", content: [{ type: "text", text: botUrl, marks: [{ type: "link", attrs: { href: botUrl } }] }] }]
+        }
       }
+    };
+
+    const createRes = await api.asApp().requestJira(route`/rest/api/3/issue`, {
+      method: 'POST',
+      headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+
+    if (createRes.status !== 201) {
+        const errorText = await createRes.text();
+        console.error("Error de Jira al crear la tarea:", errorText);
+        throw new Error("No se pudo crear la tarea de invitación.");
     }
-  };
+    
+    const newIssue = await createRes.json();
 
-  const createRes = await api.asApp().requestJira(route`/rest/api/3/issue`, {
-    method: 'POST',
-    headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
-  });
-
-  if (createRes.status !== 201) throw new Error("No se pudo crear la tarea de invitación.");
-  const newIssue = await createRes.json();
-
-  if (activeSprintId) {
-    try {
-      await new Promise(resolve => setTimeout(resolve, 1500));
-      await api.asApp().requestJira(route`/rest/agile/1.0/sprint/${activeSprintId}/issue`, {
-        method: 'POST',
-        headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
-        body: JSON.stringify({ issues: [newIssue.key] })
-      });
-    } catch (error) {}
+    if (activeSprintId) {
+      try {
+        await new Promise(resolve => setTimeout(resolve, 1500));
+        await api.asApp().requestJira(route`/rest/agile/1.0/sprint/${activeSprintId}/issue`, {
+          method: 'POST',
+          headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
+          body: JSON.stringify({ issues: [newIssue.key] })
+        });
+      } catch (error) {}
+    }
+    return { success: true };
+    
+  } catch (globalError) {
+      console.error("Error crítico en createInviteTask:", globalError);
+      throw globalError;
   }
-  return { success: true };
 });
 
 resolver.define('generateInviteLink', async (req) => {
   const { accountId } = req.payload;
   const token = Math.random().toString(36).substring(2, 8).toUpperCase();
   const webhookUrl = await webTrigger.getUrl('telegram-webhook');
+  const expiresAt = Date.now() + (24 * 60 * 60 * 1000);
+
+  await kvs.set(`pending_token_${token}`, { accountId, expiresAt });
 
   await api.fetch('https://pmbot-proxy-tgtrm3z5ca-uc.a.run.app', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       message: { text: `/start ${token}`, chat: { id: "SYSTEM_REGISTER" } },
-      system_registration: { token, accountId, forgeWebhookUrl: webhookUrl, expiresAt: Date.now() + (24 * 60 * 60 * 1000) }
+      system_registration: { token, accountId, forgeWebhookUrl: webhookUrl, expiresAt }
     })
   });
   return token;
@@ -321,7 +339,6 @@ export const pageResolver = resolver.getDefinitions();
 // [API TELEGRAM] HELPER: ENVÍO DE MENSAJES DINÁMICOS
 // ─────────────────────────────────────────────────────────
 async function sendTelegramMessage(chatId, text, inlineKeyboard = null) {
-  // LECTURA DE VARIABLE DE ENTORNO GLOBAL EN FORGE (Ver instrucciones abajo)
   const token = process.env.SECRET_TELEGRAM_BOT_TOKEN;
   if (!token) {
     console.error("Falta la variable SECRET_TELEGRAM_BOT_TOKEN en el entorno Forge.");
@@ -332,11 +349,36 @@ async function sendTelegramMessage(chatId, text, inlineKeyboard = null) {
   let payload = { chat_id: chatId, text: text, parse_mode: "Markdown" };
   if (inlineKeyboard) payload.reply_markup = { inline_keyboard: inlineKeyboard };
 
-  await api.fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
-  });
+  try {
+    const response = await api.fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error(`Telegram rechazó el mensaje Markdown (Status ${response.status}):`, errorText);
+      console.log("Intentando reenviar en formato de texto plano como respaldo...");
+      
+      payload.parse_mode = ""; 
+      const retryResponse = await api.fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      
+      if (!retryResponse.ok) {
+          console.error("Fallo definitivo al enviar a Telegram:", await retryResponse.text());
+      } else {
+          console.log("Mensaje enviado exitosamente usando el respaldo de texto plano.");
+      }
+    } else {
+      console.log("Mensaje enviado a Telegram con éxito.");
+    }
+  } catch (error) {
+    console.error("Error crítico de red intentando conectar con Telegram:", error);
+  }
 }
 
 // ─────────────────────────────────────────────────────────
@@ -471,7 +513,7 @@ export async function runTrigger(event, context) {
   const isActive = await kvs.get(`tg_active_${accountId}`);
   if (isActive === false) return;
 
-  await sendTelegramMessage(chatId, `*Nueva Asignación*\nHola *${assignee.displayName || "Equipo"}*, se te ha asignado la tarea:\n\n📌 *${issueKey} - ${summary}*`);
+  await sendTelegramMessage(chatId, `*Nueva Asignación*\nHola *${assignee.displayName || "Equipo"}*, se te ha asignado la tarea:\n\n*${issueKey} - ${summary}*`);
 }
 
 // ─────────────────────────────────────────────────────────
@@ -486,14 +528,18 @@ export async function runWebtrigger(request) {
 
     if (text.startsWith('/start')) {
       const parts = text.split(' ');
-      if (parts.length < 2 || parts[1].includes('@')) {
-        await sendTelegramMessage(chatId, `Registro denegado.\nPídele a tu líder un link de invitación.`);
-        return { body: "OK", statusCode: 200 };
+      if (parts.length >= 2 && !parts[1].includes('@')) {
+        const tokenIngresado = parts[1].toUpperCase(); 
+        const tokenData = await kvs.get(`pending_token_${tokenIngresado}`);
+
+        if (tokenData && Date.now() <= tokenData.expiresAt) {
+          const accountId = tokenData.accountId;
+          
+          await kvs.set(`tg_chat_${accountId}`, chatId);
+          await kvs.set(`tg_active_${accountId}`, true); 
+          await kvs.delete(`pending_token_${tokenIngresado}`);
+        }
       }
-      
-      // En la nueva arquitectura, el proxy de GCP se encarga del emparejamiento usando /start.
-      // Esta lógica en Jira es un respaldo en caso de latencias de enrolamiento.
-      const userRes = await api.asApp().requestJira(route`/rest/api/3/user?accountId=${parts[1]}`); // Backup id if passed
       return { body: "OK", statusCode: 200 };
     }
 
@@ -523,11 +569,35 @@ export async function runWebtrigger(request) {
   }
 
   if (body.callback_query) {
-    const callbackData = body.callback_query.data;
+    // NUEVO: Detener el reloj de carga en la interfaz de Telegram
+    const callbackQueryId = body.callback_query.id;
+    const botToken = process.env.SECRET_TELEGRAM_BOT_TOKEN;
+    await api.fetch(`https://api.telegram.org/bot${botToken}/answerCallbackQuery`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ callback_query_id: callbackQueryId })
+    });
+    
+    const rawData = body.callback_query.data;
     const chatId = body.callback_query.message.chat.id;
-    const [source, action, ...issueKeyParts] = callbackData.split('_');
+    
+    let routePrefix = "";
+    let payloadData = rawData;
+    
+    if (rawData.includes('|')) {
+        const parts = rawData.split('|');
+        routePrefix = parts[0] + "|";
+        payloadData = parts[1];
+    }
+
+    const [source, action, ...issueKeyParts] = payloadData.split('_');
     const issueKey = issueKeyParts.join('_');
     const issueDataAPI = await getIssueData(issueKey); 
+    
+    if (!issueDataAPI.projectKey) {
+        return { body: "OK", statusCode: 200 };
+    }
+
     const tituloCompleto = `*${issueKey} - ${issueDataAPI.summary}*`;
 
     if (source === 'TG') {
@@ -540,15 +610,15 @@ export async function runWebtrigger(request) {
               const openSubtasksCount = await getOpenSubtasksCount(issueKey);
               if (openSubtasksCount > 0) {
                  await sendTelegramMessage(chatId, `Atención: La tarea ${tituloCompleto} tiene ${openSubtasksCount} subtarea(s) en curso.\n\n¿Deseas moverla a "${nextTransition.to?.name}" y finalizar dependencias?`, [
-                   [ { text: "Sí, avanzar y barrer subtareas", callback_data: `TG_SWEEPFORWARD_${issueKey}` } ],
-                   [ { text: "Cancelar", callback_data: `TG_CANCEL_${issueKey}` } ]
+                   [ { text: "Sí, avanzar y barrer subtareas", callback_data: `${routePrefix}TG_SWEEPFORWARD_${issueKey}` } ],
+                   [ { text: "Cancelar", callback_data: `${routePrefix}TG_CANCEL_${issueKey}` } ]
                  ]);
                  return { body: "OK", statusCode: 200 };
               }
             }
             if (await transitionIssue(issueKey, nextTransition.id)) {
               await agregarComentarioFijo(issueKey, `Tarea movida a ${nextTransition.to?.name} vía Telegram.`);
-              await sendTelegramMessage(chatId, `Excelente. Moví el ticket a "${nextTransition.to?.name}".`);
+              await sendTelegramMessage(chatId, `Ticket *${issueKey}* enviado a ${nextTransition.to?.name}`);
             } else {
               await sendTelegramMessage(chatId, `Problema al intentar mover el ticket. Verifica permisos en Jira.`);
             }
@@ -560,9 +630,9 @@ export async function runWebtrigger(request) {
            const nextTransition = await getNextForwardTransition(issueKey, issueDataAPI.projectKey, issueDataAPI.statusId);
            if (nextTransition && await transitionIssue(issueKey, nextTransition.id)) {
              const subtasksClosed = await sweepSubtasks(issueKey);
-             const sweepMsg = subtasksClosed > 0 ? `\nSe cerraron ${subtasksClosed} subtareas asociadas.` : "";
-             await agregarComentarioFijo(issueKey, `Tarea y subtareas movidas en bloque vía Telegram.${sweepMsg}`);
-             await sendTelegramMessage(chatId, `Excelente. Moví el ticket y sus dependencias a "${nextTransition.to?.name}".${sweepMsg}`);
+             const sweepMsg = subtasksClosed > 0 ? ` (y se cerraron ${subtasksClosed} subtareas)` : "";
+             await agregarComentarioFijo(issueKey, `Tarea y subtareas movidas en bloque vía Telegram.`);
+             await sendTelegramMessage(chatId, `Ticket *${issueKey}* enviado a ${nextTransition.to?.name}${sweepMsg}`);
            }
         }
         else if (action === 'DOUBLEJUMP') {
@@ -575,7 +645,9 @@ export async function runWebtrigger(request) {
            
            if (secondTransition && await transitionIssue(issueKey, secondTransition.id)) {
                await agregarComentarioFijo(issueKey, `Tarea avanzada directamente a "${secondTransition.to?.name}" (Doble salto).`);
-               await sendTelegramMessage(chatId, `El ticket avanzó directo a "${secondTransition.to?.name}".`);
+               await sendTelegramMessage(chatId, `Ticket *${issueKey}* enviado a ${secondTransition.to?.name}`);
+           } else {
+               await sendTelegramMessage(chatId, `Ticket *${issueKey}* enviado a ${firstTransition.to?.name}`);
            }
         }
         else if (action === 'AVANCE') {
@@ -588,8 +660,8 @@ export async function runWebtrigger(request) {
         } 
         else if (action === 'SINAVANCE') {
           await sendTelegramMessage(chatId, `¿Hay algún problema o bloqueo con:\n${tituloCompleto}?\n\nSelecciona una opción:`, [
-            [ { text: "Reportar problema", callback_data: `TG_PROBLEMA_${issueKey}` } ],
-            [ { text: "Sin problemas", callback_data: `TG_SINPROBLEMA_${issueKey}` } ]
+            [ { text: "Reportar problema", callback_data: `${routePrefix}TG_PROBLEMA_${issueKey}` } ],
+            [ { text: "Sin problemas", callback_data: `${routePrefix}TG_SINPROBLEMA_${issueKey}` } ]
           ]);
         }
         else if (action === 'PROBLEMA') {
@@ -604,7 +676,7 @@ export async function runWebtrigger(request) {
           await sendTelegramMessage(chatId, `Acción cancelada.`);
         }
       } catch (error) {
-        await sendTelegramMessage(chatId, `⚠️ Ocurrió un error interno al procesar tu solicitud.`);
+        await sendTelegramMessage(chatId, `Ocurrió un error interno al procesar tu solicitud.`);
       }
     } 
   }
@@ -644,16 +716,52 @@ export async function runScheduledPings(event, context, isForced = false, target
     const leaderTimeStr = await kvs.get(`proj_time_${proj.key}`) || '17:00';
     const leaderHour = parseInt(leaderTimeStr.split(':')[0], 10);
 
-    let jqlQuery = `project = "${proj.key}" AND (resolution = Unresolved OR resolved >= -1d) AND assignee IS NOT EMPTY`;
-    if (mode === 'SCRUM') jqlQuery += ` AND sprint IN openSprints()`;
-    if (targetAccountId && runType === 'EXECUTOR') jqlQuery += ` AND assignee = "${targetAccountId}"`;
+    const statusesRes = await api.asApp().requestJira(route`/rest/api/3/project/${proj.key}/statuses`);
+    const statusMap = {};
+    if (statusesRes.status === 200) {
+      const statusesData = await statusesRes.json();
+      statusesData.forEach(it => {
+        it.statuses.forEach(st => {
+          statusMap[st.id] = st.name;
+        });
+      });
+    }
+    const workflowSequence = await kvs.get(`proj_workflow_${proj.key}`) || [];
+
+    let jqlQuery = `project = "${proj.key}" AND assignee IS NOT EMPTY`;
+    
+    if (runType === 'EXECUTOR') {
+       jqlQuery += ` AND resolution = Unresolved`;
+    } else {
+       jqlQuery += ` AND (resolution = Unresolved OR resolved >= "-1d")`;
+    }
+    
+    if (mode === 'SCRUM') {
+       jqlQuery += ` AND sprint IN openSprints()`;
+    }
+    
+    if (targetAccountId && runType === 'EXECUTOR') {
+       jqlQuery += ` AND assignee = "${targetAccountId}"`;
+    }
 
     const searchRes = await api.asApp().requestJira(route`/rest/api/3/search/jql`, {
       method: 'POST',
       headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
-      body: JSON.stringify({ jql: jqlQuery, fields: ["summary", "status", "assignee", "issuelinks", "startdate", "customfield_10015", "duedate", "updated"], maxResults: 100 })
+      body: JSON.stringify({ 
+          jql: jqlQuery, 
+          fields: ["summary", "status", "assignee", "issuelinks", "startdate", "customfield_10015", "duedate", "updated", "resolution"], 
+          maxResults: 100 
+      })
     });
     
+    if (searchRes.status !== 200) {
+        if (isForced && targetAccountId) {
+            const chatId = await kvs.get(`tg_chat_${targetAccountId}`);
+            if (chatId) await sendTelegramMessage(chatId, `Error interno en Jira buscando tus tareas. El servidor rechazó la consulta JQL.`);
+        }
+        continue;
+    }
+
     const data = await searchRes.json();
     const validTasks = [];
     const userTasks = {};
@@ -661,6 +769,7 @@ export async function runScheduledPings(event, context, isForced = false, target
     if (data.issues && data.issues.length > 0) {
       for (const issue of data.issues) {
         const assignee = issue.fields.assignee;
+        
         const startDateStr = issue.fields.startdate || issue.fields.customfield_10015;
         if (startDateStr && startDateStr.substring(0, 10) > todayStr) continue; 
 
@@ -675,6 +784,7 @@ export async function runScheduledPings(event, context, isForced = false, target
         if (isBlocked) continue; 
 
         validTasks.push(issue);
+        
         if (!(issue.fields.resolution || issue.fields.status?.statusCategory?.key === 'done')) {
           if (!userTasks[assignee.accountId]) userTasks[assignee.accountId] = { displayName: assignee.displayName, issues: [] };
           userTasks[assignee.accountId].issues.push(issue);
@@ -683,6 +793,10 @@ export async function runScheduledPings(event, context, isForced = false, target
     }
 
     if (runType === 'ALL' || runType === 'EXECUTOR') {
+      if (isForced && targetAccountId && !userTasks[targetAccountId]) {
+          userTasks[targetAccountId] = { displayName: "Integrante", issues: [] };
+      }
+
       for (const [accountId, userData] of Object.entries(userTasks)) {
         const chatId = await kvs.get(`tg_chat_${accountId}`);
         if (!chatId || await kvs.get(`tg_active_${accountId}`) === false) continue; 
@@ -691,20 +805,39 @@ export async function runScheduledPings(event, context, isForced = false, target
         const reportDays = await kvs.get(`tg_days_${accountId}`) || [1, 2, 3, 4, 5];
         if (!isForced && (!reportDays.includes(currentDay) || parseInt(reportTime.split(':')[0], 10) !== currentHour)) continue;
 
-        await sendTelegramMessage(chatId, `Hola ${userData.displayName}, revisemos tus asignaciones:`);
-        for (const issue of userData.issues) {
-          let timeStatus = "";
-          if (issue.fields.duedate) timeStatus = ` | Vence: ${issue.fields.duedate}${issue.fields.duedate < todayStr ? " (Atrasada)" : issue.fields.duedate === todayStr ? " (Hoy)" : ""}`;
+        if (userData.issues.length === 0) {
+           await sendTelegramMessage(chatId, `Hola, revisamos tus asignaciones en Kanban:\n\nTodo al día.\nNo tienes tareas pendientes activas (o tus tareas futuras aún no inician).`);
+        } else {
+           await sendTelegramMessage(chatId, `Hola ${userData.displayName}, revisemos tus asignaciones:`);
+           for (const issue of userData.issues) {
+             let timeStatus = "";
+             if (issue.fields.duedate) timeStatus = ` | Vence: ${issue.fields.duedate}${issue.fields.duedate < todayStr ? " (Atrasada)" : issue.fields.duedate === todayStr ? " (Hoy)" : ""}`;
+            
+             const routePrefix = `${accountId.substring(0,6)}|`;
+             
+             const statusCategory = issue.fields.status?.statusCategory?.key || 'new';
+             const currentStatusId = issue.fields.status?.id;
+             const nextTransition = await getNextForwardTransition(issue.key, proj.key, currentStatusId);
+             
+             const taskKeyboard = [
+                 [{ text: "Con avances", callback_data: `${routePrefix}TG_AVANCE_${issue.key}` }], 
+                 [{ text: "Sin avances", callback_data: `${routePrefix}TG_SINAVANCE_${issue.key}` }]
+             ];
 
-          const statusCategory = issue.fields.status?.statusCategory?.key || 'new';
-          const nextTransition = await getNextForwardTransition(issue.key, proj.key, issue.fields.status?.id);
-          const taskKeyboard = [[{ text: "Con avances", callback_data: `TG_AVANCE_${issue.key}` }], [{ text: "Sin avances", callback_data: `TG_SINAVANCE_${issue.key}` }]];
-
-          if (statusCategory === 'new') taskKeyboard.push([{ text: "Avanzar a siguiente etapa", callback_data: `TG_DOUBLEJUMP_${issue.key}` }]);
-          else if (nextTransition) taskKeyboard.push([{ text: `Mover a ${nextTransition.to.name.substring(0, 15)}`, callback_data: `TG_FORWARD_${issue.key}` }]);
-          else if (statusCategory === 'indeterminate') taskKeyboard.push([{ text: "Marcar como Terminada", callback_data: `TG_FORWARD_${issue.key}` }]);
-
-          await sendTelegramMessage(chatId, `↳ *${issue.key}* - [${issue.fields.summary}](${baseUrl}/browse/${issue.key})\n_Estado: ${issue.fields.status?.name || 'Desconocido'}${timeStatus}_`, taskKeyboard);
+             if (statusCategory === 'new') {
+                 let doubleJumpName = "siguiente etapa";
+                 const currentIndex = workflowSequence.indexOf(currentStatusId);
+                 if (currentIndex !== -1 && currentIndex + 2 < workflowSequence.length) {
+                     const thirdStatusId = workflowSequence[currentIndex + 2];
+                     doubleJumpName = statusMap[thirdStatusId] || "siguiente etapa";
+                 }
+                 taskKeyboard.push([{ text: `Mover a ${doubleJumpName.substring(0, 15)}`, callback_data: `${routePrefix}TG_DOUBLEJUMP_${issue.key}` }]);
+             }
+             else if (nextTransition) taskKeyboard.push([{ text: `Mover a ${nextTransition.to.name.substring(0, 15)}`, callback_data: `${routePrefix}TG_FORWARD_${issue.key}` }]);
+             else if (statusCategory === 'indeterminate') taskKeyboard.push([{ text: "Marcar como Terminada", callback_data: `${routePrefix}TG_FORWARD_${issue.key}` }]);
+             
+             await sendTelegramMessage(chatId, `- *${issue.key}* - [${issue.fields.summary}](${baseUrl}/browse/${issue.key})\n_Estado: ${issue.fields.status?.name || 'Desconocido'}${timeStatus}_`, taskKeyboard);
+           }
         }
       }
     }
@@ -724,7 +857,7 @@ export async function runScheduledPings(event, context, isForced = false, target
 
         if (leaderChatIds.length > 0) {
           if (validTasks.length === 0) {
-            const emptyMsg = `⭘ *Sin Novedades en ${proj.name}*\nEl tablero está vacío o no hay tareas activas.`;
+            const emptyMsg = `Sin Novedades en ${proj.name}\nEl tablero está vacío o no hay tareas activas.`;
             for (const chat of leaderChatIds) await sendTelegramMessage(chat, emptyMsg);
             continue;
           }
@@ -735,31 +868,63 @@ export async function runScheduledPings(event, context, isForced = false, target
           for (const issue of validTasks) {
             const name = issue.fields.assignee?.displayName.split(' ')[0] || "Alguien";
             const dueText = issue.fields.duedate ? ` (V: ${issue.fields.duedate.split('-').reverse().join('-')})` : "";
+            const statusName = issue.fields.status?.name || "Desconocido";
             
-            if (issue.fields.resolution || issue.fields.status?.statusCategory?.key === 'done') { terminadas.push(`↳ *${issue.key}* - _${name}_${dueText}`); continue; }
-            if (issue.fields.duedate && issue.fields.duedate < todayStr) atrasadas.push(`↳ *${issue.key}* - _${name}_${dueText}`);
+            let rawSummary = issue.fields.summary || "Sin título";
+            const maxLen = 35;
+            const summary = rawSummary.length > maxLen ? rawSummary.substring(0, maxLen) + "..." : rawSummary;
+
+            if (issue.fields.resolution || issue.fields.status?.statusCategory?.key === 'done') { 
+              if (new Date(issue.fields.updated) > yesterday) {
+                terminadas.push(`- *${issue.key}* (${summary}) - _${name}_${dueText}`);
+              }
+              continue; 
+            }
+            
+            if (issue.fields.duedate && issue.fields.duedate < todayStr) atrasadas.push(`- *${issue.key}* (${summary}) - _${name}_${dueText}`);
 
             if (new Date(issue.fields.updated) > yesterday) {
+              let isProblem = false;
+              let isAvance = false;
+
               const comRes = await api.asApp().requestJira(route`/rest/api/3/issue/${issue.key}/comment?orderBy=-created&maxResults=5`);
-              let categorized = false;
-              for (const c of (await comRes.json()).comments || []) {
+              const commentsData = await comRes.json();
+              
+              for (const c of commentsData.comments || []) {
                 if (new Date(c.created) > yesterday) {
-                  const text = c.body?.content?.[0]?.content?.[0]?.text || "";
-                  if (text.includes("Motivo de retraso:") || text.includes("Problema reportado:")) { problemas.push(`↳ *${issue.key}* - _${name}_${dueText}\n    💬 _"${text.split('\n').pop()}"_`); categorized = true; break; }
-                  if (text.includes("Avance reportado:")) { avances.push(`↳ *${issue.key}* - _${name}_${dueText}\n    💬 _"${text.split('\n').pop()}"_`); categorized = true; break; }
+                  const rawText = c.body?.content?.[0]?.content?.[0]?.text || "";
+                  if (rawText.includes("Motivo de retraso:") || rawText.includes("Problema reportado:")) { 
+                      const cleanText = rawText.replace("Motivo de retraso:", "").replace("Problema reportado:", "").trim();
+                      problemas.push(`- *${issue.key}* (${summary}) - _${name}_${dueText}\n  "${cleanText}"`); 
+                      isProblem = true; 
+                      break; 
+                  } else if (rawText.includes("Avance reportado:")) { 
+                      const cleanText = rawText.replace("Avance reportado:", "").trim();
+                      avances.push(`- *${issue.key}* (${summary}) - _${name}_${dueText}\n  "${cleanText}"`); 
+                      isAvance = true; 
+                      break; 
+                  } else {
+                      avances.push(`- *${issue.key}* (${summary}) - _${name}_${dueText}\n  "${rawText.trim()}"`);
+                      isAvance = true;
+                      break;
+                  }
                 }
               }
-              if (!categorized) sinNovedades.push(`↳ *${issue.key}* - _${name}_${dueText}`);
+
+              if (!isProblem && !isAvance) {
+                  sinNovedades.push(`- *${issue.key}* (${summary}) - _${name}_${dueText} [${statusName}]`);
+              }
             } else {
-              sinNovedades.push(`↳ *${issue.key}* - _${name}_${dueText}`);
+              sinNovedades.push(`- *${issue.key}* (${summary}) - _${name}_${dueText} [${statusName}]`);
             }
           }
 
-          let digestMsg = `📊 *Reporte Diario:* [${proj.name}](${baseUrl}/browse/${proj.key})\n\n✓ Terminadas: ${terminadas.length}\n⬈ Avances: ${avances.length}\n⊘ Problemas: ${problemas.length}\n◬ Atrasadas: ${atrasadas.length}\n⭘ Sin Novedades: ${sinNovedades.length}\n\n`;
-          if (terminadas.length > 0) digestMsg += `*✓ TERMINADAS*\n${terminadas.join('\n')}\n\n`;
-          if (avances.length > 0) digestMsg += `*⬈ AVANCES*\n${avances.join('\n')}\n\n`;
-          if (problemas.length > 0) digestMsg += `*⊘ PROBLEMAS*\n${problemas.join('\n')}\n\n`;
-          if (atrasadas.length > 0) digestMsg += `*◬ ATRASADAS*\n${atrasadas.join('\n')}\n\n`;
+          let digestMsg = `*Reporte Diario:* [${proj.name}](${baseUrl}/browse/${proj.key})\n\nTerminadas: ${terminadas.length}\nAvances Comentados: ${avances.length}\nProblemas: ${problemas.length}\nAtrasadas: ${atrasadas.length}\nSin Novedades: ${sinNovedades.length}\n\n`;
+          if (terminadas.length > 0) digestMsg += `*TERMINADAS*\n${terminadas.join('\n')}\n\n`;
+          if (avances.length > 0) digestMsg += `*AVANCES COMENTADOS*\n${avances.join('\n')}\n\n`;
+          if (problemas.length > 0) digestMsg += `*PROBLEMAS*\n${problemas.join('\n')}\n\n`;
+          if (atrasadas.length > 0) digestMsg += `*ATRASADAS*\n${atrasadas.join('\n')}\n\n`;
+          if (sinNovedades.length > 0) digestMsg += `*SIN NOVEDADES*\n${sinNovedades.join('\n')}\n\n`;
           
           for (const chat of leaderChatIds) await sendTelegramMessage(chat, digestMsg);
         }
